@@ -1,0 +1,29 @@
+{
+  "name": "@juanbenjumea/pi-todos",
+  "version": "0.1.0",
+  "description": "File-backed project todos for Pi with an interactive manager and agent tool",
+  "type": "module",
+  "license": "MIT",
+  "author": "Juan Benjumea",
+  "repository": { "type": "git", "url": "git+https://github.com/huaxel/pi-todos.git" },
+  "engines": { "node": ">=22.7" },
+  "keywords": ["pi-package", "pi-extension", "todos", "task-management"],
+  "pi": { "extensions": ["./index.ts"] },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": {
+    "test": "node --test todos.test.mjs",
+    "typecheck": "tsc --noEmit --strict --allowImportingTsExtensions --moduleResolution bundler --module esnext --target esnext --skipLibCheck index.ts store.mts"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "@earendil-works/pi-ai": "^1.1.0",
+    "@earendil-works/pi-tui": "^1.1.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  },
+  "files": ["index.ts", "store.mts", "README.md", "LICENSE"]
+}
