@@ -1,9 +1,10 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync, unlinkSync, utimesSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, utimesSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+const { getTodosDir, acquireLock, splitFrontMatter } = await import("./store.mts");
 const packageEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
 const packageRoot = path.dirname(path.dirname(fileURLToPath(packageEntry)));
 process.env.PI_TEST_PI_ROOT ??= packageRoot;
@@ -35,6 +36,10 @@ console.log("def.name:", def.name, "| def.execute:", typeof def.execute);
 if (typeof def.execute !== "function") process.exit(1);
 
 const tmp = mkdtempSync(path.join(tmpdir(), "todos-test-"));
+const projectRoot = path.join(tmp, "project");
+const nested = path.join(projectRoot, "src", "nested");
+mkdirSync(path.join(projectRoot, ".git"), { recursive: true });
+mkdirSync(nested, { recursive: true });
 const td = path.join(tmp, ".pi", "todos");
 const ctx = {
   cwd: tmp,
@@ -44,6 +49,8 @@ const ctx = {
 };
 const run = (params) => def.execute("call1", params, new AbortController().signal, () => {}, ctx);
 const assert = (cond, msg) => { if (!cond) { console.log("FAIL:", msg); process.exit(1); } console.log("ok:", msg); };
+assert(getTodosDir(nested) === path.join(projectRoot, ".pi", "todos"), "nested cwd resolves todos at project root");
+assert(splitFrontMatter("\uFEFF  " + JSON.stringify({ title: "x" }) + "\n\nbody").frontMatter === JSON.stringify({ title: "x" }), "front matter tolerates BOM and leading whitespace");
 
 const a = await run({ action: "create", title: "Add tests", tags: ["qa"], body: "write tests" });
 assert(a.details.action === "create" && !a.details.error, "create #1");
@@ -62,6 +69,25 @@ r = await run({ action: "list", query: "ship" });
 assert(r.details.todos.length === 1 && r.details.todos[0].id === bId, "list fuzzy query");
 r = await run({ action: "list-all", limit: 1 });
 assert(r.details.todos.length === 1, "list-all limit=1");
+const closedForFilter = await run({ action: "create", title: "Closed filter" });
+await run({ action: "update", id: closedForFilter.details.todo.id, status: "closed" });
+r = await run({ action: "list", status: "closed" });
+assert(r.details.todos.length === 1 && r.details.todos[0].id === closedForFilter.details.todo.id, "list status=closed returns closed todos");
+r = await run({ action: "list", limit: 1 });
+assert(r.details.todos.length === 1 && r.details.todos.every((todo) => todo.status !== "closed"), "list applies limit after excluding closed todos");
+r = await run({ action: "create", title: "Bad status", status: "bogus" });
+assert(r.details.error?.includes("Invalid status"), "invalid status rejected");
+const normalizedStatus = await run({ action: "create", title: "Normalized status", status: " Done " });
+assert(normalizedStatus.details.todo.status === "done", "status is normalized before storage");
+r = await run({ action: "create", title: "Bad date", due: "2026-99-44" });
+assert(r.details.error?.includes("Invalid due date"), "invalid due date rejected");
+r = await run({ action: "create", title: "Impossible date", due: "2026-02-30" });
+assert(r.details.error?.includes("Invalid due date"), "impossible calendar date rejected");
+r = await run({ action: "create", title: "Impossible datetime", due: "2026-02-30T12:00:00Z" });
+assert(r.details.error?.includes("Invalid due date"), "impossible datetime calendar date rejected");
+await run({ action: "delete", id: normalizedStatus.details.todo.id });
+await run({ action: "delete", id: closedForFilter.details.todo.id });
+assert(readdirSync(path.join(td, ".trash")).some((f) => f.startsWith(closedForFilter.details.todo.id)), "delete moves todo to trash");
 
 r = await run({ action: "claim", id: aId });
 assert(r.details.todo.assigned_to_session === "test-session", "claim assigns session");
@@ -75,6 +101,12 @@ r = await run2({ action: "claim", id: aId });
 assert(r.details.error && r.details.error.includes("already assigned"), "claim without force refuses other session");
 r = await run2({ action: "claim", id: aId, force: true });
 assert(!r.details.error && r.details.todo.assigned_to_session === "other-session", "claim with force takes over");
+r = await run({ action: "update", id: aId, title: "unauthorized" });
+assert(r.details.error?.includes("assigned to session"), "update refuses another session's claim");
+r = await run({ action: "append", id: aId, body: "unauthorized" });
+assert(r.details.error?.includes("assigned to session"), "append refuses another session's claim");
+r = await run({ action: "delete", id: aId });
+assert(r.details.error?.includes("assigned to session"), "delete refuses another session's claim");
 r = await run({ action: "claim", id: aId, force: true });
 assert(!r.details.error && r.details.todo.assigned_to_session === "test-session", "original session force reclaims");
 
@@ -133,6 +165,19 @@ const backups = readdirSync(path.join(td, ".trash", "backups"));
 assert(backups.some((f) => f.startsWith(badId)), "original backed up before repair");
 r = await run({ action: "validate" });
 assert(r.details.issues === 0, "validate clean after repair");
+// A stale-lock confirmation must not remove a replacement lock.
+const raceId = "cafefeed";
+const raceLock = path.join(td, `${raceId}.lock`);
+writeFileSync(raceLock, JSON.stringify({ id: raceId, pid: 1, token: "old", created_at: new Date(old).toISOString() }));
+utimesSync(raceLock, new Date(old), new Date(old));
+const raceResult = await acquireLock(td, raceId, { confirm: async () => {
+  writeFileSync(raceLock, JSON.stringify({ id: raceId, pid: 2, token: "replacement", created_at: new Date().toISOString() }));
+  return true;
+}});
+assert(typeof raceResult === "object" && raceResult.error, "stale takeover rejects a changed lock");
+assert(JSON.parse(readFileSync(raceLock, "utf8")).token === "replacement", "changed lock survives stale takeover");
+unlinkSync(raceLock);
+
 // --- configurable lock TTL ---
 writeFileSync(path.join(td, "settings.json"), JSON.stringify({ gc: true, gcDays: 7, lockTtlMs: 5000 }));
 const ttlTodo = await run({ action: "create", title: "TTL test" });

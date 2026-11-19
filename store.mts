@@ -72,7 +72,7 @@ export function displayTodoId(id: string): string {
 }
 
 export function isTodoClosed(status: string): boolean {
-	return ["closed", "done"].includes(status.toLowerCase());
+	return ["closed", "done"].includes(status.trim().toLowerCase());
 }
 
 export function clearAssignmentIfClosed(todo: TodoFrontMatter): void {
@@ -97,12 +97,24 @@ function sortTodos(todos: TodoFrontMatter[]): TodoFrontMatter[] {
 	});
 }
 
+function findProjectRoot(cwd: string): string {
+	const original = path.resolve(cwd);
+	let current = original;
+	while (true) {
+		if (existsSync(path.join(current, ".git"))) return current;
+		const parent = path.dirname(current);
+		if (parent === current) return original;
+		current = parent;
+	}
+}
+
 export function getTodosDir(cwd: string): string {
+	const root = findProjectRoot(cwd);
 	const overridePath = process.env[TODO_PATH_ENV];
 	if (overridePath && overridePath.trim()) {
-		return path.resolve(cwd, overridePath.trim());
+		return path.resolve(root, overridePath.trim());
 	}
-	return path.resolve(cwd, TODO_DIR_NAME);
+	return path.resolve(root, TODO_DIR_NAME);
 }
 
 function getTodoSettingsPath(todosDir: string): string {
@@ -226,6 +238,7 @@ function findJsonObjectEnd(content: string): number {
 }
 
 export function splitFrontMatter(content: string): { frontMatter: string; body: string } {
+	content = content.replace(/^\uFEFF/, "").trimStart();
 	if (!content.startsWith("{")) {
 		return { frontMatter: "", body: content };
 	}
@@ -284,7 +297,14 @@ export async function ensureTodosDir(todosDir: string) {
 
 export async function writeTodoFile(filePath: string, todo: TodoRecord) {
 	todo.updated_at = new Date().toISOString();
-	await fs.writeFile(filePath, serializeTodo(todo), "utf8");
+	const tempPath = `${filePath}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+	try {
+		await fs.writeFile(tempPath, serializeTodo(todo), { encoding: "utf8", flag: "wx" });
+		await fs.rename(tempPath, filePath);
+	} catch (error) {
+		await fs.unlink(tempPath).catch(() => undefined);
+		throw error;
+	}
 }
 
 function generateTodoId(todosDir: string): string {
@@ -305,17 +325,41 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 	}
 }
 
+async function moveLockIfMatches(
+	lockPath: string,
+	matches: (info: LockInfo | null, mtimeMs: number) => boolean,
+): Promise<boolean> {
+	const movedPath = `${lockPath}.move-${crypto.randomBytes(8).toString("hex")}`;
+	try {
+		await fs.rename(lockPath, movedPath);
+	} catch {
+		return false;
+	}
+	const [info, stats] = await Promise.all([
+		readLockInfo(movedPath),
+		fs.stat(movedPath).catch(() => null),
+	]);
+	if (stats && matches(info, stats.mtimeMs)) {
+		await fs.unlink(movedPath).catch(() => undefined);
+		return true;
+	}
+	// The path may have changed between inspection and rename. Restore unexpected locks.
+	await fs.rename(movedPath, lockPath).catch(() => undefined);
+	return false;
+}
+
 export async function acquireLock(
 	todosDir: string,
 	id: string,
 	owner: TodoLockOwner,
 	stealStale = false,
+	settingsOverride?: TodoSettings,
 ): Promise<(() => Promise<void>) | { error: string }> {
 	const lockPath = getLockPath(todosDir, id);
 	const now = Date.now();
 	const session = owner.session ?? null;
 	// Per-directory lock TTL override from <todo-dir>/settings.json.
-	const settings = await readTodoSettings(todosDir);
+	const settings = settingsOverride ?? await readTodoSettings(todosDir);
 	const lockTtlMs = settings.lockTtlMs ?? LOCK_TTL_MS;
 
 	for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -338,13 +382,7 @@ export async function acquireLock(
 				throw error;
 			}
 			return async () => {
-				try {
-					const current = await readLockInfo(lockPath);
-					if (current?.token !== token) return;
-					await fs.unlink(lockPath);
-				} catch {
-					// ignore
-				}
+				await moveLockIfMatches(lockPath, (current) => current?.token === token);
 			};
 		} catch (error: unknown) {
 			const code =
@@ -361,9 +399,14 @@ export async function acquireLock(
 				const holder = info?.session ? ` (session ${info.session})` : "";
 				return { error: `Todo ${displayTodoId(id)} is locked${holder}. Try again later.` };
 			}
+			const observed = await readLockInfo(lockPath);
+			const observedStats = await fs.stat(lockPath).catch(() => null);
 			if (stealStale) {
-				// force: steal a stale lock without confirmation (works headless)
-				await fs.unlink(lockPath).catch(() => undefined);
+				if (observedStats) {
+					await moveLockIfMatches(lockPath, (info, mtimeMs) =>
+						info?.token === observed?.token && mtimeMs <= now - lockTtlMs,
+					);
+				}
 				continue;
 			}
 			if (!owner.confirm) {
@@ -376,7 +419,11 @@ export async function acquireLock(
 			if (!ok) {
 				return { error: `Todo ${displayTodoId(id)} remains locked.` };
 			}
-			await fs.unlink(lockPath).catch(() => undefined);
+			if (observedStats) {
+				await moveLockIfMatches(lockPath, (info, mtimeMs) =>
+					info?.token === observed?.token && mtimeMs === observedStats.mtimeMs && mtimeMs <= now - lockTtlMs,
+				);
+			}
 		}
 	}
 
@@ -496,13 +543,19 @@ export async function createTodo(
 	owner: TodoLockOwner = {},
 ): Promise<TodoRecord | { error: string }> {
 	await ensureTodosDir(todosDir);
-	const id = generateTodoId(todosDir);
-	const todo: TodoRecord = {
-		id, title: input.title, status: input.status ?? "open", tags: input.tags ?? [],
-		body: input.body ?? "", due: input.due || undefined, created_at: new Date().toISOString(),
-	};
-	return withTodoLock(todosDir, id, owner, async () => {
-		await writeTodoFile(getTodoPath(todosDir, id), todo);
-		return todo;
-	});
+	for (let attempt = 0; attempt < 10; attempt += 1) {
+		const id = generateTodoId(todosDir);
+		const todo: TodoRecord = {
+			id, title: input.title, status: input.status?.trim().toLowerCase() ?? "open", tags: input.tags ?? [],
+			body: input.body ?? "", due: input.due || undefined, created_at: new Date().toISOString(),
+		};
+		const result = await withTodoLock(todosDir, id, owner, async () => {
+			if (existsSync(getTodoPath(todosDir, id))) return { error: "__TODO_ID_COLLISION__" } as const;
+			await writeTodoFile(getTodoPath(todosDir, id), todo);
+			return todo;
+		});
+		if (typeof result === "object" && "error" in result && result.error === "__TODO_ID_COLLISION__") continue;
+		return result;
+	}
+	return { error: "Failed to generate unique todo id" };
 }

@@ -23,7 +23,7 @@
  * Defaults:
  * {
  *   "gc": true,   // delete closed todos older than gcDays on startup
- *   "gcDays": 7,  // age threshold for GC (days since created_at)
+ *   "gcDays": 7,  // age threshold for GC (days since last update)
  *   "lockTtlMs": 1800000  // optional lock TTL override (default 30 min)
  * }
  *
@@ -84,7 +84,7 @@ import {
 
 function lockOwner(ctx: ExtensionContext): TodoLockOwner {
 	return {
-		session: ctx.sessionManager.getSessionFile(),
+		session: ctx.sessionManager.getSessionId(),
 		confirm: ctx.hasUI ? (title, message) => ctx.ui.confirm(title, message) : undefined,
 	};
 }
@@ -316,7 +316,7 @@ class TodoSelectorComponent extends Container implements Focusable {
 
 	private applyFilter(query: string): void {
 		this.filteredTodos = filterTodos(this.allTodos, query);
-		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredTodos.length - 1));
+		this.selectedIndex = 0;
 		this.updateList();
 	}
 
@@ -707,14 +707,21 @@ async function garbageCollectTodos(
 				const filePath = path.join(todosDir, entry);
 				let release: (() => Promise<void>) | null = null;
 				try {
-					const lock = await acquireLock(todosDir, id, lockOwner(ctx), true);
+					// Avoid contending for locks on open or recently closed todos.
+					const preview = await fs.readFile(filePath, "utf8");
+					const previewParts = splitFrontMatter(preview);
+					const previewTodo = parseFrontMatter(previewParts.frontMatter, id);
+					if (!isTodoClosed(previewTodo.status)) return;
+					const previewDate = Date.parse(previewTodo.updated_at || previewTodo.created_at);
+					if (!Number.isFinite(previewDate) || previewDate >= cutoff) return;
+					const lock = await acquireLock(todosDir, id, lockOwner(ctx), true, settings);
 					if (typeof lock === "object") return;
 					release = lock;
 					const content = await fs.readFile(filePath, "utf8");
 					const { frontMatter } = splitFrontMatter(content);
 					const parsed = parseFrontMatter(frontMatter, id);
 					if (!isTodoClosed(parsed.status)) return;
-					const createdAt = Date.parse(parsed.created_at);
+					const createdAt = Date.parse(parsed.updated_at || parsed.created_at);
 					if (!Number.isFinite(createdAt)) return;
 					if (createdAt < cutoff) {
 						// Move to .trash instead of deleting: GC must never destroy data.
@@ -734,6 +741,22 @@ async function garbageCollectTodos(
 			}),
 	);
 	return moveFailures;
+}
+
+function validateTodoFields(params: { status?: string; due?: string }): string | null {
+	if (params.status !== undefined && !["open", "in_progress", "blocked", "closed", "done"].includes(params.status.trim().toLowerCase())) {
+		return `Invalid status: ${params.status}. Use open, in_progress, blocked, closed, or done.`;
+	}
+	if (params.due) {
+		const dateMatch = /^(\d{4}-\d{2}-\d{2})(?:$|T)/.exec(params.due);
+		const parsed = Date.parse(params.due);
+		const calendarDate = dateMatch ? new Date(`${dateMatch[1]}T00:00:00.000Z`) : null;
+		const calendarDateValid = Boolean(calendarDate && Number.isFinite(calendarDate.getTime()) && calendarDate.toISOString().slice(0, 10) === dateMatch?.[1]);
+		if (!dateMatch || !Number.isFinite(parsed) || !calendarDateValid) {
+			return `Invalid due date: ${params.due}. Use ISO date or datetime.`;
+		}
+	}
+	return null;
 }
 
 function getTodoTitle(todo: TodoFrontMatter): string {
@@ -848,9 +871,7 @@ function filterTodosForTool(
 		filtered = filterTodos(filtered, query);
 	}
 	const limit = params.limit;
-	if (limit !== undefined && limit > 0) {
-		filtered = filtered.slice(0, limit);
-	}
+	if (limit !== undefined && limit > 0) filtered = filtered.slice(0, Math.floor(limit));
 	return filtered;
 }
 
@@ -1066,17 +1087,35 @@ async function validateTodos(
 			: "invalid JSON front matter";
 		issues.push({ id, problem });
 		if (repair) {
-			const backupDir = path.join(todosDir, ".trash", "backups");
-			await fs.mkdir(backupDir, { recursive: true });
-			const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-			await fs
-				.rename(filePath, path.join(backupDir, `${id}-${stamp}.md`))
-				.catch(() => undefined);
-			const todo = parseTodoContent(content, id);
-			if (!todo.title) todo.title = "(untitled)";
-			if (!todo.created_at) todo.created_at = new Date().toISOString();
-			await writeTodoFile(filePath, todo);
-			repaired += 1;
+			const lock = await acquireLock(todosDir, id, {}, true);
+			if (typeof lock === "object") continue;
+			let backupPath: string | undefined;
+			try {
+				const latestContent = await fs.readFile(filePath, "utf8");
+				const latestParts = splitFrontMatter(latestContent);
+				try {
+					JSON.parse(latestParts.frontMatter);
+					continue;
+				} catch { /* still malformed */ }
+				const backupDir = path.join(todosDir, ".trash", "backups");
+				await fs.mkdir(backupDir, { recursive: true });
+				const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+				backupPath = path.join(backupDir, `${id}-${stamp}.md`);
+				await fs.rename(filePath, backupPath);
+				const todo = parseTodoContent(latestContent, id);
+				if (!todo.body.trim()) todo.body = latestContent;
+				if (!todo.title) todo.title = "(untitled)";
+				if (!todo.created_at) todo.created_at = new Date().toISOString();
+				try {
+					await writeTodoFile(filePath, todo);
+				} catch (error) {
+					await fs.rename(backupPath, filePath).catch(() => undefined);
+					throw error;
+				}
+				repaired += 1;
+			} finally {
+				await lock();
+			}
 		}
 	}
 
@@ -1120,7 +1159,12 @@ async function deleteTodo(
 	const result = await withTodoLock(todosDir, normalizedId, lockOwner(ctx), async () => {
 		const existing = ensureTodoExists(filePath, normalizedId);
 		if (!existing) return { error: `Todo ${displayTodoId(id)} not found` } as const;
-		await fs.unlink(filePath);
+		if (existing.assigned_to_session && existing.assigned_to_session !== ctx.sessionManager.getSessionId() && !stealStale) {
+			return { error: `Todo ${displayTodoId(id)} is assigned to session ${existing.assigned_to_session}. Use force to override.` } as const;
+		}
+		const trashDir = path.join(todosDir, ".trash");
+		await fs.mkdir(trashDir, { recursive: true });
+		await fs.rename(filePath, path.join(trashDir, `${normalizedId}-${Date.now()}.md`));
 		return existing;
 	}, stealStale);
 
@@ -1134,7 +1178,7 @@ async function deleteTodo(
 export default function todosExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const todosDir = getTodosDir(ctx.cwd);
-		await ensureTodosDir(todosDir);
+		if (!existsSync(todosDir)) return;
 		const settings = await readTodoSettings(todosDir);
 		const gcMoveFailures = await garbageCollectTodos(todosDir, settings, ctx);
 		if (gcMoveFailures > 0 && ctx.hasUI) {
@@ -1159,13 +1203,13 @@ export default function todosExtension(pi: ExtensionAPI) {
 			return;
 		}
 		const note =
-			"This project has file-backed todos in .pi/todos (todo tool). Before planning new work, " +
+			`This project has file-backed todos in ${todosDir} (todo tool). Before planning new work, ` +
 			"check whether the work is already tracked (todo action=list). If it is, claim the todo " +
 			"before working on it and close it when complete.";
-		const existing = event.systemPromptOptions.appendSystemPrompt;
-		event.systemPromptOptions.appendSystemPrompt = existing
-			? `${existing}\n${note}`
-			: note;
+		const guideline = `The todo tool is available for this project backlog. ${note}`;
+		if (!event.systemPromptOptions.promptGuidelines.includes(guideline)) {
+			event.systemPromptOptions.promptGuidelines.push(guideline);
+		}
 	});
 
 	pi.registerTool({
@@ -1173,7 +1217,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 		label: "Todo",
 		description:
 			`Manage file-based todos stored as markdown files under <project>/.pi/todos (override with PI_TODO_PATH). ` +
-			"Actions: list, list-all, get, create, update, append, delete, claim, release. " +
+			"Actions: list, list-all, get, create, update, append, delete, claim, release, validate. " +
 			"list/list-all accept optional filters: status (open, closed, or exact), tag, query (fuzzy text), limit. " +
 			"Title is the short summary; body is long-form markdown notes (update replaces, append adds). " +
 			"Todo ids are shown as TODO-<hex>; id parameters accept TODO-<hex> or the raw hex filename. " +
@@ -1187,9 +1231,15 @@ export default function todosExtension(pi: ExtensionAPI) {
 			switch (action) {
 				case "list": {
 					const todos = await listTodos(todosDir);
-					const filtered = filterTodosForTool(todos, params);
+					const filtered = filterTodosForTool(todos, { ...params, limit: undefined });
 					const { assignedTodos, openTodos } = splitTodosByAssignment(filtered);
-					const listedTodos = [...assignedTodos, ...openTodos];
+					const eligibleTodos = params.status?.trim().toLowerCase() === "closed"
+						? filtered
+						: [...assignedTodos, ...openTodos];
+					const limit = params.limit;
+					const listedTodos = limit !== undefined && limit > 0
+						? eligibleTodos.slice(0, Math.floor(limit))
+						: eligibleTodos;
 					const currentSessionId = ctx.sessionManager.getSessionId();
 					return {
 						content: [{ type: "text", text: serializeTodoListForAgent(listedTodos) }],
@@ -1238,6 +1288,8 @@ export default function todosExtension(pi: ExtensionAPI) {
 				}
 
 				case "create": {
+					const fieldError = validateTodoFields(params);
+					if (fieldError) return { content: [{ type: "text", text: fieldError }], details: { action: "create", error: fieldError } };
 					if (!params.title) {
 						return {
 							content: [{ type: "text", text: "Error: title required" }],
@@ -1260,6 +1312,8 @@ export default function todosExtension(pi: ExtensionAPI) {
 				}
 
 				case "update": {
+					const fieldError = validateTodoFields(params);
+					if (fieldError) return { content: [{ type: "text", text: fieldError }], details: { action: "update", error: fieldError } };
 					if (!params.id) {
 						return {
 							content: [{ type: "text", text: "Error: id required" }],
@@ -1289,10 +1343,13 @@ export default function todosExtension(pi: ExtensionAPI) {
 					async () => {
 						const existing = ensureTodoExists(filePath, normalizedId);
 						if (!existing) return { error: `Todo ${displayId} not found` } as const;
+						if (existing.assigned_to_session && existing.assigned_to_session !== ctx.sessionManager.getSessionId() && !params.force) {
+							return { error: `Todo ${displayId} is assigned to session ${existing.assigned_to_session}. Use force to override.` } as const;
+						}
 
 						existing.id = normalizedId;
 						if (params.title !== undefined) existing.title = params.title;
-						if (params.status !== undefined) existing.status = params.status;
+						if (params.status !== undefined) existing.status = params.status.trim().toLowerCase();
 						if (params.tags !== undefined) existing.tags = params.tags;
 						if (params.body !== undefined) existing.body = params.body;
 						if (params.due !== undefined) existing.due = params.due || undefined;
@@ -1349,6 +1406,9 @@ export default function todosExtension(pi: ExtensionAPI) {
 						async () => {
 							const existing = ensureTodoExists(filePath, normalizedId);
 							if (!existing) return { error: `Todo ${displayId} not found` } as const;
+							if (existing.assigned_to_session && existing.assigned_to_session !== ctx.sessionManager.getSessionId() && !params.force) {
+								return { error: `Todo ${displayId} is assigned to session ${existing.assigned_to_session}. Use force to override.` } as const;
+							}
 							if (!params.body || !params.body.trim()) {
 								return existing;
 							}
@@ -1550,8 +1610,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 			const searchTerm = (args ?? "").trim();
 
 			if (ctx.mode !== "tui") {
-				const text = formatTodoList(todos);
-				console.log(text);
+				ctx.ui.notify(formatTodoList(todos), "info");
 				return;
 			}
 
